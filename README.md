@@ -1,0 +1,2 @@
+# tradingbot-capital
+tradingbot Daytrading
