@@ -1,14 +1,31 @@
-﻿# Ignore environment and secrets
+﻿# Environment and secrets
 .env
+.env.*
+*.key
+*.pem
 
-# Python cache & build
+# Python
 __pycache__/
 *.pyc
-
-# Virtual environment
+*.pyo
+*.pyd
 .venv/
+venv/
+build/
+dist/
 
-# Logs and data dumps
+# Logs and data
 *.log
 *.csv
 data/
+logs/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.code-workspace
