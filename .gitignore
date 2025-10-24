@@ -1,0 +1,14 @@
+﻿# Ignore environment and secrets
+.env
+
+# Python cache & build
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Logs and data dumps
+*.log
+*.csv
+data/

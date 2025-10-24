@@ -1,0 +1,1 @@
+När vi kör loopen sen måste vi ha med en variabel som kollar vilka instrument som är handlade. Så att inte Loopen kör ut det instrumentet som en post igen, det kan ju bli fel om bara ett instrument ligger i pipen för köp, efter 10 loopar har vi ju då bara ett instrument med tio poster vilket inte blir bra.
