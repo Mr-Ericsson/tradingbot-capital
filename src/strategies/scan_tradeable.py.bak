@@ -17,16 +17,7 @@ BASE = os.getenv("BASE_URL")
 
 # ---- Config ----
 DEFAULT_MAX_SPREAD_FRAC = 0.002
-DEFAULT_ALLOWED_TYPES = {
-    "SHARES",
-    "INDICES",
-    "COMMODITIES",
-    "ETF",
-    "ETFS",
-    "CURRENCIES",
-    "CRYPTOCURRENCIES",
-}
-
+DEFAULT_ALLOWED_TYPES = {"SHARES", "INDICES", "COMMODITIES", "ETF", "ETFS"}
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 30
 POOL_SIZE = 32
@@ -103,50 +94,27 @@ def status_summary(markets):
 
 def row_from_market(m, max_spread_frac, allowed_types):
     status = (m.get("marketStatus") or "").upper()
-    modes = {str(x).upper() for x in (m.get("marketModes") or [])}
-
-    # kräv öppet för handel och filtrera bort close-only/suspenderad
-    if status != "TRADEABLE":
-        return None
-
-    REJECT_MODES = {
-        "CLOSE_ONLY",
-        "CLOSING_ONLY",
-        "EDITS_ONLY",
-        "SUSPENDED",
-        "DISABLED",
-        "HALTED",
-    }
-    if any(x in modes for x in REJECT_MODES):
-        return None
-
     if status != "TRADEABLE":
         return None
     modes = m.get("marketModes") or []
     if any((str(x).upper() in REJECT_MODES) for x in modes):
         return None
     itype = (m.get("instrumentType") or "").upper()
-    if allowed_types is not None and itype not in allowed_types:
+    if itype not in allowed_types:
         return None
-
     bid, offer = m.get("bid"), m.get("offer")
     if not bid or not offer:
         return None
-    bid = float(bid)
-    offer = float(offer)
-    mid = (offer + bid) / 2.0
-    spread = abs(offer - bid)
-    if mid <= 0:
-        return None
-    if (spread / mid) > max_spread_frac:
+    spread = float(offer) - float(bid)
+    if spread / offer > max_spread_frac:
         return None
     return {
         "epic": m.get("epic"),
-        "bid": bid,
-        "offer": offer,
+        "bid": float(bid),
+        "offer": float(offer),
         "spread": round(spread, 6),
-        "spread_pct": round((spread / mid) * 100, 4),
-        "name": (m.get("name") or m.get("instrumentName") or ""),
+        "spread_pct": round(spread / offer * 100, 4),
+        "name": m.get("instrumentName") or "",
         "type": itype,
     }
 
@@ -162,35 +130,12 @@ def write_csv(path, fields, rows):
 # ---- MAIN ----
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument(
-        "--no-spread",
-        action="store_true",
-        help="Skippa spreadfilter: returnera alla TRADEABLE",
-    )
-
-    ap.add_argument("--spread", type=float, default=0.002)
-    ap.add_argument(
-        "--types", type=str, default="CURRENCIES,INDICES,COMMODITIES,SHARES"
-    )
+    ap.add_argument("--spread", type=float, default=DEFAULT_MAX_SPREAD_FRAC)
+    ap.add_argument("--types", type=str, default=",".join(DEFAULT_ALLOWED_TYPES))
     ap.add_argument("--outfile", type=str, default=SCAN_OUTPUT_PATH)
-    from datetime import datetime
-
     args = ap.parse_args()
 
-    if args.no_spread:
-        args.spread = 999.0
-        print("[filter] NO-SPREAD-läge aktivt – ignorerar spreadfilter")
-
-    # Normalisera typer (FX → CURRENCIES, FOREX → CURRENCIES)
-    # Typ-normalisering + ALL-stöd
-    raw_types = {t.strip().upper() for t in (args.types or "").split(",") if t.strip()}
-    alias = {"FX": "CURRENCIES", "FOREX": "CURRENCIES", "ETF": "ETFS"}
-    norm_types = {alias.get(t, t) for t in raw_types}
-    use_all_types = (not norm_types) or ("ALL" in norm_types)
-    allowed_types = None if use_all_types else norm_types
-    if datetime.utcnow().weekday() >= 5:  # lör/sön
-        norm_types.add("CRYPTOCURRENCIES")
-        t0 = time.time()
+    t0 = time.time()
 
     print("[fetch] Hämtar alla marknader...")
     markets = fetch_all_markets()
@@ -203,9 +148,7 @@ def main():
 
     rows = []
     for m in markets:
-        # Efter
-        r = row_from_market(m, args.spread, allowed_types)
-
+        r = row_from_market(m, args.spread, set(args.types.split(",")))
         if r:
             rows.append(r)
 
@@ -256,15 +199,9 @@ def main():
         "spr%".rjust(8),
         "name",
     )
-    for r in sorted(enriched, key=lambda x: x.get("spread_pct", float("inf")))[:20]:
-        epic = r.get("epic", "")
-        bid = float(r.get("bid", 0) or 0)
-        offer = float(r.get("offer", 0) or 0)
-        spread = float(r.get("spread", 0) or 0)
-        spr_pct = float(r.get("spread_pct", 0) or 0)
-        name = (r.get("name") or r.get("instrumentName") or "")[:40]
+    for r in sorted(enriched, key=lambda x: x["spread_pct"])[:20]:
         print(
-            f"{epic:<12} {bid:>12.6f} {offer:>12.6f} {spread:>10.6f} {spr_pct:>7.3f}% {name}"
+            f"{r['epic']:<12} {r['bid']:>12.6f} {r['offer']:>12.6f} {r['spread']:>10.6f} {r['spread_pct']:>7.3f}% {(r['name'] or '')[:40]}"
         )
 
 

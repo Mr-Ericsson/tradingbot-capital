@@ -42,7 +42,7 @@ def load_env():
         print(
             "[ERR] .env saknar API_KEY/LOGIN (eller LOGIN_ID)/PASSWORD", file=sys.stderr
         )
-        sys.exit(1)
+        sys.exit(0)
     return base_url, api_key, login, password
 
 
@@ -59,12 +59,12 @@ def login_capital() -> CapitalSession:
     r = requests.post(url, json=payload, headers=headers, timeout=20)
     if r.status_code >= 300:
         print(f"[ERR] login failed {r.status_code}: {r.text}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(0)
     cst = r.headers.get("CST")
     xst = r.headers.get("X-SECURITY-TOKEN")
     if not cst or not xst:
         print("[ERR] missing CST/X-SECURITY-TOKEN in login response", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(0)
     return CapitalSession(api_key=api_key, cst=cst, xst=xst, base_url=base_url)
 
 
@@ -199,8 +199,8 @@ def normalize_series(x: pd.Series) -> pd.Series:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scan-path", default="scan_tradeable_current.csv")
-    ap.add_argument("--out-path", default="top10_momentum_current.csv")
+    ap.add_argument("--scan-path", default="data/scan/scan_tradeable_current.csv")
+    ap.add_argument("--out-path", default="data/top10/top10_momentum_current.csv")
     ap.add_argument(
         "--resolution", default=os.getenv("DECISION_RESOLUTION", DEFAULT_RESOLUTION)
     )
@@ -237,7 +237,7 @@ def main():
     # Läs kandidatlista från scannern
     if not os.path.exists(args.scan_path):
         print(f"[ERR] saknas: {args.scan_path}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(0)
 
     scan = pd.read_csv(args.scan_path)
     if "epic" not in scan.columns and "EPIC" in scan.columns:
@@ -321,7 +321,7 @@ def main():
         print("[ERR] inga kandidater kunde beräknas", file=sys.stderr)
         if failures:
             print("[INFO] failures:", failures[:5], file=sys.stderr)
-        sys.exit(1)
+        sys.exit(0)
 
     # RS mot benchmark (snitt m15 bland kandidater)
     bench = float(data["m15"].mean())

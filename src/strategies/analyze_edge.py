@@ -3,7 +3,7 @@
 
 """
 analyze_edge_score.py
-- Input:  top10_momentum_current.csv (från rankningssteget) – måste innehålla kolumnen 'epic' och gärna 'leverage'
+    csv_path = CSV_PATH
 - Output: orders.csv  (EPIC, ENTRY, SL, TP, LEVERAGE) – används av place_pending_orders.py
 
 Logik:
@@ -15,15 +15,30 @@ Logik:
 """
 
 import os, csv, sys, json, time
+import os
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+CSV_PATH = os.path.join(BASE_DIR, "data", "top10", "top10_momentum_current.csv")
+import os
 from typing import Optional, Dict, Any
+import os
 from datetime import datetime, timezone as tz
+import os
 
 import argparse
+import os
 import requests
+import os
 from pathlib import Path
+import os
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+CSV_PATH = os.path.join(BASE_DIR, "data", "top10", "top10_momentum_current.csv")
+
 
 # === Standardiserad session ===
-from capital_session import get_session
+from src.brokers.capitalcom.session import get_session
+import os
 
 ROOT = Path(__file__).resolve().parent
 
@@ -32,7 +47,7 @@ BASE_URL = os.getenv("BASE_URL") or os.getenv(
     "CAPITAL_BASE_URL", "https://demo-api-capital.backend-capital.com"
 )
 
-INPUT_TOP_FILE = os.getenv("TOP10_FILE") or str(ROOT / "top10_momentum_current.csv")
+csv_path = CSV_PATH
 OUTPUT_ORDERS = os.getenv("ORDERS_FILE") or str(ROOT / "orders.csv")
 
 # Entry/SL/TP-parametrar
@@ -339,8 +354,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--input",
-        default=INPUT_TOP_FILE,
-        help="top10-momentum CSV (default: top10_momentum_current.csv)",
+        default=CSV_PATH,
     )
     ap.add_argument(
         "--output", default=OUTPUT_ORDERS, help="orders CSV (default: orders.csv)"
