@@ -174,6 +174,23 @@ def compute_vwap_dist_pct(df: pd.DataFrame, window: int = 200) -> float:
     return (last_close / vwap - 1.0) * 100.0
 
 
+def compute_volume_spike(df: pd.DataFrame, short: int = 5, long: int = 20) -> float:
+    """
+    Volymskifte = (sum vol senaste 'short') / (glidande medel vol 'long').
+    Om volym saknas -> 1.0 (neutral).
+    """
+    if df.empty or "volume" not in df.columns:
+        return 1.0
+    v = df["volume"].fillna(0.0)
+    if len(v) < max(short, long) + 1:
+        return 1.0
+    short_sum = float(v.tail(short).sum())
+    long_mean = float(v.rolling(window=long).mean().iloc[-1] or 0.0)
+    if long_mean <= 0.0:
+        return 1.0
+    return short_sum / (long_mean * (short / 1.0))
+
+
 def compute_edge(
     mom: float, spike: float, rs: float, spread_pct: float, spread_weight: float
 ) -> float:
@@ -221,11 +238,7 @@ def main():
     ap.add_argument(
         "--mom-min", type=float, default=float(os.getenv("MOM_MIN", MOM_MIN_DEFAULT))
     )
-    ap.add_argument(
-        "--spread-weight",
-        type=float,
-        default=float(os.getenv("SPREAD_WEIGHT", SPREAD_WEIGHT_DEFAULT)),
-    )
+
     ap.add_argument(
         "--sector-cap",
         type=int,
@@ -291,6 +304,8 @@ def main():
             m5_pct = compute_momentum(df, 5)
 
             spike = compute_atr_spike(df, window=20)
+            vol_spike = compute_volume_spike(df, short=5, long=20)
+
             spread_pct = float(r.get("spread_pct") or 0.0)
 
             # NYTT: VWAP-distans i procent (senaste ~200 rader)
@@ -309,6 +324,7 @@ def main():
                     "m5_pct": m5_pct,  # <— NY
                     "vwap_dist_pct": vwap_dist_pct,  # <— NY
                     "spike": spike,
+                    "vol_spike": vol_spike,
                 }
             )
 
@@ -333,7 +349,17 @@ def main():
     mom_min = args.mom_min
 
     pre = data.copy()
-    mask = (pre["mom"] >= mom_min) & (pre["rs"] >= rs_min) & (pre["spike"] >= spike_min)
+
+    mask = (
+        (pre["mom"] >= mom_min)
+        & (pre["rs"] >= rs_min)
+        & (pre["spike"] >= spike_min)
+        & (pre["mom30"] >= 0.3)
+        & (pre["spike"] <= 2.5)
+        & (pre["vwap_dist_pct"].abs() <= 1.0)
+        & (pre["spread_pct"] <= 0.5)
+        & (pre["vol_spike"] >= 1.2)
+    )
 
     dropped = pre.loc[~mask].copy()
     if not dropped.empty:
@@ -357,15 +383,28 @@ def main():
             file=sys.stderr,
         )
 
-    # Edge-score
-    spread_weight = args.spread_weight
-    survivors["edge_raw"] = survivors.apply(
-        lambda z: compute_edge(
-            z["mom"], z["spike"], z["rs"], z["spread_pct"], spread_weight
-        ),
-        axis=1,
+    # Edge-score (normaliserad, 0–100)
+    # Först skapar vi hjälpkolumn där lägre |VWAP-distans| är bättre:
+    survivors["vwap_prox"] = -survivors["vwap_dist_pct"].abs()
+
+    Z_m30 = normalize_series(survivors["mom30"])
+    Z_vol = normalize_series(survivors["vol_spike"])
+    Z_atr = normalize_series(survivors["spike"])
+    Z_rs = normalize_series(survivors["rs"])
+    Z_vwap = normalize_series(survivors["vwap_prox"])
+    Z_spread = normalize_series(survivors["spread_pct"])
+
+    survivors["edge"] = (
+        0.35 * Z_m30
+        + 0.25 * Z_vol
+        + 0.15 * Z_atr
+        + 0.15 * Z_rs
+        + 0.10 * Z_vwap
+        - 0.05 * Z_spread
     )
-    survivors["edge"] = normalize_series(survivors["edge_raw"])
+
+    # Normalisera färdiga edge till 0–100 för jämförbarhet
+    survivors["edge"] = normalize_series(survivors["edge"])
 
     # Sektortak (post-sortering)
     survivors = survivors.sort_values("edge", ascending=False).reset_index(drop=True)
@@ -399,12 +438,14 @@ def main():
             "mom60",
             "mom",
             "m15",
-            "m5_pct",  # <— NY
+            "m5_pct",
+            "vol_spike",  # <— NY
             "rs",
             "spike",
             "edge",
-            "score",  # <— NY
-            "vwap_dist_pct",  # <— NY
+            "score",
+            "vwap_dist_pct",
+            "vwap_prox",  # <— NY (för transparens/analys)
         ]
 
         for c in cols:

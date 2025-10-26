@@ -168,10 +168,13 @@ def main():
         help="Skippa spreadfilter: returnera alla TRADEABLE",
     )
 
-    ap.add_argument("--spread", type=float, default=0.002)
+    ap.add_argument("--spread", type=float, default=0.005)
     ap.add_argument(
-        "--types", type=str, default="CURRENCIES,INDICES,COMMODITIES,SHARES"
+        "--types",
+        type=str,
+        default="CURRENCIES,INDICES,COMMODITIES,SHARES,CRYPTOCURRENCIES",
     )
+
     ap.add_argument("--outfile", type=str, default=SCAN_OUTPUT_PATH)
     from datetime import datetime
 
