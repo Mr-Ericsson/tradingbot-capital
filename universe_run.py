@@ -13,6 +13,11 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
 import sys
 import warnings
+import exchange_calendars as xcals
+import pytz
+
+# EDGE-10 imports
+from edge10.market_timing import get_nyse_calendar, market_status_summary
 
 warnings.filterwarnings("ignore")
 
@@ -83,6 +88,37 @@ def map_capital_symbol_to_yahoo(epic: str) -> str:
     return epic
 
 
+def is_etf_yahoo_postmap(yahoo_symbol: str) -> Tuple[bool, str]:
+    """
+    POST-MAPPING ETF CHECK: Kontrollera om Yahoo symbol är ETF efter mapping
+    Level C ETF failsafe - kontrollera Yahoo quoteType och nameblob patterns
+    """
+    try:
+        ticker = yf.Ticker(yahoo_symbol)
+        info = ticker.info or {}
+        
+        # quoteType check
+        quote_type = (info.get("quoteType", "") or "").upper()
+        if quote_type == "ETF":
+            return True, f"ETF_YAHOO_POSTMAP: quoteType={quote_type}"
+        
+        # Name-based patterns
+        long_name = info.get("longName", "") or ""
+        short_name = info.get("shortName", "") or ""
+        nameblob = (long_name + " " + short_name).upper()
+        
+        ETF_KEYS = [" ETF", " ETN", " ETP", " TRUST", " INDEX FUND"]
+        for key in ETF_KEYS:
+            if key in nameblob:
+                return True, f"ETF_YAHOO_POSTMAP: name_pattern={key.strip()}"
+        
+        return False, ""
+        
+    except Exception as e:
+        # Fail open - vi har redan Level A ETF-filter
+        return False, f"ETF_YAHOO_POSTMAP: validation_failed={str(e)[:50]}"
+
+
 def get_yahoo_data(
     ticker: str, end_date: str, days_back: int = 300
 ) -> Optional[pd.DataFrame]:
@@ -108,6 +144,21 @@ def get_yahoo_data(
         elif "AdjClose" not in df.columns:
             # Om ingen AdjClose finns, använd Close som fallback
             df["AdjClose"] = df["Close"]
+
+        # ANTI-LOOKAHEAD GUARD: Droppa dagens data om marknaden inte stängt
+        today_date = pd.Timestamp.utcnow().date()
+        if not df.empty and df.index.max().date() == today_date:
+            # Kontrollera om US marknaden är stängd
+            try:
+                cal = xcals.get_calendar("XNYS")
+                now_utc = pd.Timestamp.utcnow()
+                
+                # Om marknaden är öppen eller inte stängt idag, droppa sista raden
+                if cal.is_open_at_time(now_utc):
+                    df = df.iloc[:-1]  # Droppa pågående dag
+            except:
+                # Fallback: droppa alltid dagens data
+                df = df.iloc[:-1]
 
         return df
 
@@ -304,17 +355,54 @@ def match_similar(
 
 
 def get_market_date(end_date: str) -> str:
-    """Hitta senaste handelsdagen <= end_date"""
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    """
+    Hitta senaste stängda handelsdagen <= end_date med NYSE kalender
+    ANTI-LOOKAHEAD: Använder endast closed trading sessions
+    """
+    try:
+        # Använd centraliserad NYSE kalender
+        cal = get_nyse_calendar()
+        
+        # Konvertera input datum till pandas Timestamp
+        end_dt = pd.Timestamp(end_date).tz_localize("UTC")
+        
+        # Hitta alla sessions inom senaste 10 dagarna
+        start_search = end_dt - pd.Timedelta(days=10)
+        sessions = cal.sessions_in_range(start_search.date(), end_dt.date())
+        
+        # Ta senaste session som är <= end_date
+        valid_sessions = [s for s in sessions if s <= end_dt]
+        
+        if valid_sessions:
+            last_session = valid_sessions[-1]
+            
+            # Kontrollera att sessionen är stängd
+            session_close = cal.session_close(last_session)
+            now_utc = pd.Timestamp.utcnow()
+            
+            if session_close <= now_utc:
+                # Session är stängd, safe att använda
+                return last_session.strftime("%Y-%m-%d")
+            else:
+                # Sessionen pågår, använd föregående
+                if len(valid_sessions) > 1:
+                    return valid_sessions[-2].strftime("%Y-%m-%d")
+        
+        # Fallback till enkel weekday-logik
+        end_dt_naive = datetime.strptime(end_date, "%Y-%m-%d")
+        for i in range(8):
+            check_date = end_dt_naive - timedelta(days=i)
+            if check_date.weekday() < 5:  # Måndag=0 till Fredag=4
+                return check_date.strftime("%Y-%m-%d")
+                
+    except Exception as e:
+        # Fallback till gamla logiken om exchange_calendars misslyckas
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        for i in range(8):
+            check_date = end_dt - timedelta(days=i)
+            if check_date.weekday() < 5:
+                return check_date.strftime("%Y-%m-%d")
 
-    # Enkel approximation: gå bakåt max 7 dagar för att hitta en handelsdag
-    for i in range(8):
-        check_date = end_dt - timedelta(days=i)
-        # Undvik helger (lördag=5, söndag=6)
-        if check_date.weekday() < 5:  # Måndag=0 till Fredag=4
-            return check_date.strftime("%Y-%m-%d")
-
-    # Fallback
     return end_date
 
 
@@ -892,6 +980,36 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
     # Lägg till Yahoo symbol
     df_final["symbol_yahoo"] = df_final["epic"].apply(map_capital_symbol_to_yahoo)
 
+    # POST-MAPPING ETF FAILSAFE (Level C)
+    logger.info("🔍 POST-MAPPING ETF CHECK: Validating Yahoo symbols...")
+    post_map_excluded = []
+    pre_postmap_count = len(df_final)
+    
+    for idx, row in df_final.iterrows():
+        yahoo_symbol = row["symbol_yahoo"]
+        is_etf, reason = is_etf_yahoo_postmap(yahoo_symbol)
+        
+        if is_etf:
+            # Add to excluded list
+            excluded_row = {
+                "epic": row["epic"],
+                "name": row["name"],
+                "symbol_yahoo": yahoo_symbol,
+                "reason": reason,
+                "filter_stage": "POST_MAP_ETF_CHECK"
+            }
+            post_map_excluded.append(excluded_row)
+            excluded_list.append(excluded_row)
+    
+    # Remove ETFs found in post-mapping check
+    if post_map_excluded:
+        etf_symbols = [e["symbol_yahoo"] for e in post_map_excluded]
+        df_final = df_final[~df_final["symbol_yahoo"].isin(etf_symbols)].copy()
+        logger.info(f"🚫 POST-MAP ETF FILTER: Removed {len(post_map_excluded)} ETFs after Yahoo validation")
+        logger.info(f"   ETFs found: {', '.join(etf_symbols[:10])}{' ...' if len(etf_symbols) > 10 else ''}")
+    
+    logger.info(f"Efter POST-MAPPING ETF check: {len(df_final)} aktier ({pre_postmap_count - len(df_final)} ETF:er excluded)")
+
     return df_final
 
 
@@ -903,6 +1021,13 @@ def main():
     logger.info(f"CSV: {args.csv}")
     logger.info(f"Date: {args.date}")
     logger.info(f"Output: {args.outdir}")
+
+    # Market timing status
+    timing_status = market_status_summary()
+    logger.info(f"🕐 Market Timing Status:")
+    logger.info(f"   Current ET: {timing_status.get('current_time_et', 'Unknown')}")
+    logger.info(f"   Current SE: {timing_status.get('current_time_se', 'Unknown')}")
+    logger.info(f"   Market Open: {timing_status.get('is_market_open', 'Unknown')}")
 
     # Skapa output directory
     create_output_dir(args.outdir)
