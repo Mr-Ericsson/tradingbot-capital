@@ -1,78 +1,57 @@
 # 🎯 EDGE-10 Trading System - Tradingbot Capital
 
-Python-baserad automatisk tradingbot för Capital.com med EDGE-10 v1.1 system.
+Python-baserad automatisk tradingbot för Capital.com med EDGE-10 system.
 
-## 🚀 MANUELL WORKFLOW - STEG FÖR STEG
+## 🚀 HUVUDPIPELINE - STEP 0 → 1 → 2
 
-### 📋 DAGLIG TRADING PROCESS (KOMPLETT GUIDE)
-
-#### **STEG 1: FÖRBEREDELSER**
+### ⚡ **STEP 0: US-Instrument Data Acquisition (1.3 sekunder)**
 ```bash
-# 1a. Kontrollera att alla dependencies är installerade
-pip install -r requirements.txt
+# Hämta ENDAST US-aktier från Capital.com med 0.3% spread filter
+python -m src.strategies.scan_tradeable
+```
+- **Output:** `data/scan/all_instruments_capital.csv` (952 US-aktier)
+- **Tid:** 1.3 sekunder
+- **Filter:** US-börsen + spread ≤ 0.3% + inga ETF:er
 
-# 1b. Verifiera att Capital.com data finns
-ls data/scan/all_instruments_capital.csv
+### 🧮 **STEP 1: EDGE-10 Analys (8.9 minuter)**
+```bash
+# HYBRID version - optimal balans mellan hastighet och precision
+python universe_run_hybrid.py --csv data/scan/all_instruments_capital.csv --date 2025-10-27 --outdir edge10_snabb --batch-size 10 --max-workers 2 --days-back 90
+```
+- **Input:** `data/scan/all_instruments_capital.csv` (från Step 0)
+- **Output:** `edge10_snabb/top_10.csv` (TOP-10 med EdgeScores)
+- **Processing:** 743 aktier analyserade på 8.9 minuter
+- **Features:** Yahoo Finance data + EdgeScore ranking
 
-# 1c. Kontrollera API credentials (.env konfiguration)
-python -c "from src.brokers.capitalcom.client import CapitalComClient; print('API OK')"
+### 📋 **STEP 2: Order Generation (sekunder)**
+```bash
+# Konvertera TOP-10 till Capital.com trading orders
+python edge10_generate_orders.py --top10 edge10_snabb/top_10.csv --output edge10_final_orders.csv
+```
+- **Input:** `edge10_snabb/top_10.csv` (från Step 1)
+- **Output:** `edge10_final_orders.csv` (Trading orders)
+- **Format:** Bracket orders med SL=2%, TP=3%, $100/position
+
+## ✅ **TOTAL PIPELINE: ~10 MINUTER**
+**Step 0 (1.3s) → Step 1 (8.9min) → Step 2 (seconds) = REDO FÖR TRADING!**
+
+## 📊 **SENASTE VERIFIERADE RESULTAT (2025-10-28)**
+
+### TOP-10 Output (EdgeScore-Sorterat):
+```
+1. NEE    | EdgeScore: 80.9 | NextEra Energy (+2.43% DayReturn, 2.12x RelVol)
+2. KMB    | EdgeScore: 80.7 | Kimberly-Clark (+1.49% DayReturn, 1.69x RelVol)  
+3. EW     | EdgeScore: 80.4 | Edwards Lifesciences (+6.34% DayReturn, 2.68x RelVol)
+4. NVS    | EdgeScore: 79.2 | Novartis ADR (+0.89% DayReturn, 1.82x RelVol)
+5. TGT    | EdgeScore: 78.5 | Target (+2.65% DayReturn, 1.59x RelVol)
 ```
 
-#### **STEG 2: EDGE-10 ANALYS (HYBRID VERSION)**
-```bash
-# 2a. Kör EDGE-10 analys för idag (REKOMMENDERAD - 7-8 min)
-python universe_run_hybrid.py --csv data/scan/all_instruments_capital.csv --date 2025-10-28 --outdir edge10_smart --batch-size 10 --max-workers 2 --days-back 90
-
-# 2b. Verifiera att TOP-10 genererades
-ls edge10_smart/top_10.csv edge10_smart/top_100.csv edge10_smart/excluded.csv
-
-# 2c. Granska TOP-10 candidates
-Get-Content edge10_smart/top_10.csv | Select-Object -First 12
-```
-
-#### **STEG 3: GENERERA TRADING ORDERS**
-```bash
-# 3a. Konvertera TOP-10 till Capital.com orders
-python edge10_generate_orders.py --top10 edge10_smart/top_10.csv --output final_orders.csv
-
-# 3b. Verifiera order format
-Get-Content final_orders.csv | Select-Object -First 5
-
-# 3c. Kontrollera total risk exposure (ska vara max $100)
-python -c "import pandas as pd; df=pd.read_csv('final_orders.csv'); print(f'Total risk: ${df[\"amount\"].sum()}')"
-```
-
-#### **STEG 4: LÄGG TRADING ORDERS**
-```bash
-# 4a. Kontrollera nuvarande positioner först
-python status_positions_orders.py
-
-# 4b. Lägg orders via Capital.com API (DEMO MODE)
-python place_pending_orders.py --orders final_orders.csv --account-mode demo
-
-# 4c. Verifiera att orders placerades korrekt
-python status_positions_orders.py
-```
-
-#### **STEG 5: POSITION MONITORING**
-```bash
-# 5a. Kontrollera aktiva positioner regelbundet
-python status_positions_orders.py
-
-# 5b. Manuel position stängning (vid behov)
-python quick_close_all.py
-
-# 5c. Automatisk stängning före marknadsstängning
-python auto_close_positions.py --account-mode demo --dry-run --close-offset 30
-```
-
-### 🔄 ALTERNATIV WORKFLOW (ORIGINAL VERSION)
-
-#### **För Maximal Precision (43+ timmar runtime):**
-```bash
-# Endast för helger eller specialanalys
-python universe_run.py --csv data/scan/all_instruments_capital.csv --date 2025-10-28 --outdir edge10_original
-```
+### Pipeline Performance:
+- **Step 0:** 952 US-aktier på 1.3 sekunder ✅
+- **Step 1:** 743 aktier analyserade på 8.9 minuter ✅  
+- **Symbol mapping:** 84% success rate (743/882)
+- **EdgeScore range:** 77.6 - 80.9 (bra spridning)
+- **Total:** ~10 minuter för komplett process ✅
 
 ## 🔧 SYSTEM VERSIONER
 
