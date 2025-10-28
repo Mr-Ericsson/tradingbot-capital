@@ -158,6 +158,16 @@ def filter_and_categorize(markets: List[Dict[str, Any]]) -> pd.DataFrame:
         (df["market_status"] == "TRADEABLE") & (df["bid"] > 0) & (df["ask"] > 0)
     )
 
+    # Identifiera amerikanska aktier (NYSE/NASDAQ)
+    def is_us_stock(row):
+        if row["asset_class"] != "stock":
+            return False
+        epic = str(row.get("epic", ""))
+        # US aktier har vanligen korta alfanumeriska koder utan punkter
+        return len(epic) <= 5 and epic.isalpha() and "." not in epic
+
+    df["is_us_stock"] = df.apply(is_us_stock, axis=1)
+
     # Spread quality (nu borde fungera!)
     def spread_quality(spread_pct):
         if pd.isna(spread_pct):
@@ -208,8 +218,13 @@ def main():
     parser.add_argument(
         "--max-spread",
         type=float,
-        default=None,
-        help="Maximum spread i procent (t.ex. 0.5 för 0.5%)",
+        default=0.3,
+        help="Maximum spread i procent (default: 0.3 för 0.3%)",
+    )
+    parser.add_argument(
+        "--exclude-closed",
+        action="store_true",
+        help="Ta bort CLOSED instrument (behåller amerikanska aktier som öppnar kl 15:30)",
     )
     parser.add_argument(
         "--stats", action="store_true", help="Visa statistik över hämtade instrument"
@@ -259,6 +274,22 @@ def main():
             print(
                 f"  → Filtrerade till {len(df)} instrument med spread <= {args.max_spread}%"
             )
+
+        # Ny filtrering: Ta bort CLOSED instrument men behåll amerikanska aktier
+        if args.exclude_closed:
+            # Behåll: TRADEABLE instrument ELLER amerikanska aktier (som öppnar 15:30)
+            before_closed_filter = len(df)
+            df = df[(df["market_status"] == "TRADEABLE") | (df["is_us_stock"] == True)]
+            print(
+                f"  → Filtrerade bort CLOSED (behåller US-aktier): {len(df)} instrument"
+            )
+            us_closed_kept = len(
+                df[(df["market_status"] == "CLOSED") & (df["is_us_stock"] == True)]
+            )
+            if us_closed_kept > 0:
+                print(
+                    f"    (behöll {us_closed_kept} stängda amerikanska aktier som öppnar 15:30)"
+                )
 
         # Sortera efter asset_class, sedan spread
         df = df.sort_values(["asset_class", "spread_pct", "epic"])
