@@ -17,24 +17,12 @@ import exchange_calendars as xcals
 import pytz
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-import requests
 
 # EDGE-10 imports
 from edge10.market_timing import get_nyse_calendar, market_status_summary
 from edge10.symbol_mapper import SymbolMapper
 
 warnings.filterwarnings("ignore")
-
-# FIX: Configure yfinance session with proper headers to avoid IP blocking
-import yfinance as yf
-
-session = requests.Session()
-session.headers.update(
-    {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-)
-yf.base.requests_session = session
 
 
 def setup_logging():
@@ -70,10 +58,7 @@ def parse_arguments():
         "--outdir", default="out_hybrid", help="Output directory för CSV-filer"
     )
     parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=5,
-        help="Batch size för Yahoo downloads (reducerad från 100 för att undvika rate limiting)",
+        "--batch-size", type=int, default=100, help="Batch size för Yahoo downloads"
     )
     parser.add_argument(
         "--max-workers", type=int, default=8, help="Max parallel workers"
@@ -157,104 +142,6 @@ def test_date_with_fallback(target_date: str, test_tickers: List[str] = None) ->
     return target_date
 
 
-def validate_etapp1_datakontrakt(results: List[dict], logger) -> List[dict]:
-    """
-    ETAPP 1: Validera datakontrakt innan output
-    Kontrollera att alla rader uppfyller Etapp 1-kraven
-    """
-    valid_results = []
-    invalid_results = []
-
-    for result in results:
-        ticker = result.get("Ticker", "UNKNOWN")
-        spread_pct = result.get("SpreadPct", 0)
-
-        # Kontrollera spread ≤ 0.3%
-        if spread_pct > 0.3:
-            invalid_results.append(
-                {
-                    "ticker": ticker,
-                    "reason": f"SpreadPct {spread_pct:.3f}% > 0.3%",
-                    "result": result,
-                }
-            )
-            continue
-
-        # Kontrollera att vi har Yahoo symbol (implicit genom att vi kom hit)
-        if not result.get("Ticker"):
-            invalid_results.append(
-                {
-                    "ticker": ticker,
-                    "reason": "Missing Ticker/YahooSymbol",
-                    "result": result,
-                }
-            )
-            continue
-
-        # Kontrollera pris ≥ $2.00 (indirekt via Open/Close)
-        open_price = result.get("Open", 0)
-        close_price = result.get("Close", 0)
-        if open_price < 2.0 and close_price < 2.0:
-            invalid_results.append(
-                {
-                    "ticker": ticker,
-                    "reason": f"Price too low: Open=${open_price:.2f}, Close=${close_price:.2f}",
-                    "result": result,
-                }
-            )
-            continue
-
-        # Godkänd
-        valid_results.append(result)
-
-    # Logga resultatet
-    if invalid_results:
-        logger.warning(
-            f"⚠️ DATAKONTRAKT VIOLATIONS: {len(invalid_results)} results failed validation"
-        )
-        for item in invalid_results[:3]:  # Visa första 3
-            logger.warning(f"   {item['ticker']}: {item['reason']}")
-        if len(invalid_results) > 3:
-            logger.warning(f"   ... and {len(invalid_results) - 3} more")
-
-    logger.info(
-        f"✅ DATAKONTRAKT OK: {len(valid_results)}/{len(results)} results passed validation"
-    )
-    return valid_results
-
-
-def check_etf_level_c(yahoo_symbol: str, logger) -> Tuple[bool, str]:
-    """
-    ETAPP 1: ETF Level C - Post-mapping validering via Yahoo quoteType
-    Kontrollerar om en framgångsrikt mappad symbol faktiskt är en ETF
-    """
-    try:
-        # Hämta Yahoo ticker info för quoteType
-        ticker = yf.Ticker(yahoo_symbol)
-        info = ticker.info
-
-        quote_type = info.get("quoteType", "").upper()
-        long_name = info.get("longName", "").upper()
-
-        # Kontrollera om det är ETF enligt Yahoo
-        if quote_type == "ETF":
-            return True, f"Yahoo quoteType=ETF"
-
-        # Extra check: långt namn innehåller ETF-markers
-        etf_markers = ["ETF", "EXCHANGE TRADED FUND", "INDEX FUND"]
-        for marker in etf_markers:
-            if marker in long_name:
-                return True, f"longName contains '{marker}'"
-
-        # Godkänd - inte ETF
-        return False, "Validated as stock"
-
-    except Exception as e:
-        # Om vi inte kan validera, anta att det är säkert (konservativ approach)
-        logger.warning(f"ETF Level C validation failed for {yahoo_symbol}: {e}")
-        return False, f"Validation failed: {e}"
-
-
 def normalize_spread_pct(spread_pct):
     """Normalisera spread till decimal format"""
     if pd.isna(spread_pct):
@@ -320,60 +207,30 @@ def batch_download_yahoo_data(
     )
 
     try:
-        # yfinance batch download - prefer single-threaded to avoid session/thread issues
+        # yfinance batch download
         tickers_str = " ".join(tickers)
-        logger.info(
-            f"Attempting batch yf.download for {len(tickers)} tickers (threads=False)"
-        )
         data = yf.download(
             tickers_str,
             start=start_date,
             end=end_date,
             group_by="ticker",
             progress=False,
-            threads=False,
+            threads=True,
         )
 
         result = {}
         failed_tickers = []
 
         for ticker in tickers:
-            df = None
             try:
                 if len(tickers) == 1:
                     # Single ticker case
                     df = data.copy()
                 else:
                     # Multi-ticker case
-                    # Some yfinance batches return columns differently; guard with try/except
-                    try:
-                        df = data[ticker].copy()
-                    except Exception:
-                        # Fallback: try to extract by second-level column names
-                        try:
-                            df = data.xs(ticker, axis=1, level=1).copy()
-                        except Exception:
-                            df = pd.DataFrame()
+                    df = data[ticker].copy()
 
-                # If batch result missing or too small, try per-ticker download as fallback
-                if df is None or df.empty or len(df) < 30:
-                    logger.info(
-                        f"Batch download insufficient for {ticker} (rows={0 if df is None else len(df)}). Falling back to per-ticker download"
-                    )
-                    try:
-                        df = yf.download(
-                            ticker,
-                            start=start_date,
-                            end=end_date,
-                            progress=False,
-                            threads=False,
-                        )
-                        # small pause to avoid rate-limiting when falling back
-                        time.sleep(0.15)
-                    except Exception as e:
-                        logger.warning(f"Per-ticker fallback failed for {ticker}: {e}")
-
-                if df is None or df.empty or len(df) < 30:
+                if df.empty or len(df) < 30:  # Reducera från 50 till 30 dagar
                     failed_tickers.append(ticker)
                     continue
 
@@ -402,15 +259,10 @@ def batch_download_yahoo_data(
                 f"Failed tickers: {', '.join(failed_tickers[:10])}{' ...' if len(failed_tickers) > 10 else ''}"
             )
 
-        # FIX: Add rate limiting pause to avoid Yahoo Finance IP blocking
-        time.sleep(1.0)  # 1s pause between batches
-
         return result
 
     except Exception as e:
         logger.error(f"BATCH DOWNLOAD FAILED: {e}")
-        # FIX: Add rate limiting pause even on error
-        time.sleep(1.0)  # 1 second pause on error
         return {}
 
 
@@ -487,8 +339,7 @@ def process_ticker_fast(
 
     df = data_dict[ticker].copy()
 
-    # Require at least 30 historical rows (30 trading days) for our fast pipeline
-    if df.empty or len(df) < 30:
+    if df.empty or len(df) < 50:
         return None
 
     try:
@@ -749,9 +600,7 @@ def save_results_fast(
     logger.info(f"Saved TOP-10: {top10_path}")
 
 
-def load_and_filter_capital_csv_fast(
-    csv_path: str, logger
-) -> Tuple[pd.DataFrame, List[dict]]:
+def load_and_filter_capital_csv_fast(csv_path: str, logger) -> pd.DataFrame:
     """
     FAST FILTERING: Optimerad för hastighet men behåller säkerhet
     """
@@ -779,87 +628,34 @@ def load_and_filter_capital_csv_fast(
         f"Efter ETF filter: {len(df_filtered)} (exkluderade {excluded_count} ETF:er)"
     )
 
-    # ETAPP 1: Lägg till spread + prisgolv filter
-    logger.info("🎯 ETAPP 1: Implementerar spread + prisgolv filter...")
-
-    # Filter 3: Spread ≤ 0.3%
-    df_filtered["spread_pct_norm"] = df_filtered["SpreadPct"].apply(
-        normalize_spread_pct
-    )
-    df_spread = df_filtered[df_filtered["spread_pct_norm"] <= 0.003]  # 0.3%
+    # Simplified: SKIPPA alla andra filter - bara US stocks + ETF-filter
     logger.info(
-        f"Efter spread filter (≤0.3%): {len(df_spread)} (removed {len(df_filtered) - len(df_spread)})"
+        f"🎯 SIMPLIFIED APPROACH: Bara US stocks + ETF filter (inga andra filter)"
     )
-
-    # Filter 4: Prisgolv ≥ $2.00 (använd OfferPrice som fallback för Close)
-    def get_price_for_filter(row):
-        if pd.notna(row.get("Close")):
-            return row["Close"]
-        elif pd.notna(row.get("OfferPrice")):
-            return row["OfferPrice"]
-        elif pd.notna(row.get("BidPrice")):
-            return row["BidPrice"]
-        return 0.0
-
-    df_spread["filter_price"] = df_spread.apply(get_price_for_filter, axis=1)
-    df_price = df_spread[df_spread["filter_price"] >= 2.00]
-    logger.info(
-        f"Efter prisgolv filter (≥$2.00): {len(df_price)} (removed {len(df_spread) - len(df_price)})"
-    )
-
-    # Använd df_price som df_filtered för vidare processing
-    df_filtered = df_price
 
     # Symbol mapping med SymbolMapper
     logger.info(f"🔗 Starting SMART symbol mapping...")
     mapper = SymbolMapper()
 
     # Batch map alla epics
-    epics = df_filtered["Epic"].tolist()
+    epics = df_filtered["epic"].tolist()
     logger.info(f"Mapping {len(epics)} epics to Yahoo symbols...")
 
     mapping_results = mapper.batch_map_symbols(epics, validate=True)
 
-    # Filtrera till endast framgångsrika mappningar och kontrollera ETF Level C
+    # Filtrera till endast framgångsrika mappningar
     successful_mappings = []
     failed_mappings = []
-    etf_excluded = []
 
     for _, row in df_filtered.iterrows():
-        epic = row["Epic"]
+        epic = row["epic"]
         yahoo_symbol = mapping_results.get(epic)
 
         if yahoo_symbol:
-            # ETAPP 1: ETF Level C - kontrollera Yahoo quoteType
-            is_etf_level_c, etf_reason = check_etf_level_c(yahoo_symbol, logger)
-
-            if is_etf_level_c:
-                # Exkludera ETF:er som slapp igenom Level A
-                etf_excluded.append(
-                    {
-                        "epic": epic,
-                        "yahoo_symbol": yahoo_symbol,
-                        "reason": f"ETF Level C: {etf_reason}",
-                        "name": row.get("name", ""),
-                        "spread_pct": row.get("spread_pct", 0),
-                    }
-                )
-                logger.info(
-                    f"⛔ ETF Level C excluded: {epic} → {yahoo_symbol} ({etf_reason})"
-                )
-            else:
-                # Godkänd för vidare processing
-                row_dict = row.to_dict()
-                row_dict["symbol_yahoo"] = yahoo_symbol
-                row_dict["spread_pct_norm"] = normalize_spread_pct(
-                    row.get("spread_pct")
-                )
-                # ETAPP 1: Lägg till mapping metadata
-                row_dict["map_source"] = "SymbolMapper"
-                row_dict["map_confidence"] = (
-                    "High" if epic == yahoo_symbol else "Medium"
-                )
-                successful_mappings.append(row_dict)
+            row_dict = row.to_dict()
+            row_dict["symbol_yahoo"] = yahoo_symbol
+            row_dict["spread_pct_norm"] = normalize_spread_pct(row.get("spread_pct"))
+            successful_mappings.append(row_dict)
         else:
             failed_mappings.append(epic)
 
@@ -868,21 +664,15 @@ def load_and_filter_capital_csv_fast(
     logger.info(f"✅ SYMBOL MAPPING COMPLETE:")
     logger.info(f"   Successful: {len(successful_mappings)} symbols")
     logger.info(f"   Failed: {len(failed_mappings)} symbols")
-    logger.info(f"   ETF Level C excluded: {len(etf_excluded)} symbols")
 
     if failed_mappings:
         logger.info(
             f"   Failed symbols: {', '.join(failed_mappings[:10])}{' ...' if len(failed_mappings) > 10 else ''}"
         )
 
-    if etf_excluded:
-        logger.info(
-            f"   ETF excluded: {', '.join([item['epic'] for item in etf_excluded[:5]])}{' ...' if len(etf_excluded) > 5 else ''}"
-        )
-
     logger.info(f"Final filtered dataset: {len(df_mapped)} instruments")
 
-    return df_mapped, etf_excluded
+    return df_mapped
 
 
 def main():
@@ -911,14 +701,14 @@ def main():
     logger.info(f"📅 Using market date: {market_date} (tested: {tested_date})")
 
     # Load and filter Capital CSV
-    capital_df, etf_excluded_list = load_and_filter_capital_csv_fast(args.csv, logger)
+    capital_df = load_and_filter_capital_csv_fast(args.csv, logger)
 
     if len(capital_df) == 0:
         logger.error("❌ Inga instrument kvar efter filtrering!")
         return
 
-    # Prepare date range for batch download - USE TESTED DATE!
-    end_date_dt = pd.Timestamp(tested_date) + pd.Timedelta(days=1)
+    # Prepare date range for batch download
+    end_date_dt = pd.Timestamp(market_date) + pd.Timedelta(days=1)
     start_date_dt = end_date_dt - pd.Timedelta(days=args.days_back)
     start_date = start_date_dt.strftime("%Y-%m-%d")
     end_date = end_date_dt.strftime("%Y-%m-%d")
@@ -999,10 +789,6 @@ def main():
     logger.info("🧮 Calculating EdgeScores...")
     all_results = calculate_edge_scores_fast(all_results)
 
-    # ETAPP 1: Validera datakontrakt
-    logger.info("🔍 Validating Etapp 1 datakontrakt...")
-    all_results = validate_etapp1_datakontrakt(all_results, logger)
-
     # Select TOP candidates
     logger.info("🏆 Selecting TOP candidates...")
     top_100, top_10 = select_top_candidates_fast(all_results)
@@ -1010,21 +796,6 @@ def main():
     # Save results
     logger.info("💾 Saving results...")
     save_results_fast(all_results, top_100, top_10, args.outdir, logger)
-
-    # ETAPP 1: Skriv excluded.csv med ETF Level C-exkluderingar
-    excluded_path = os.path.join(args.outdir, "excluded.csv")
-    excluded_df = pd.DataFrame(
-        etf_excluded_list,
-        columns=(
-            ["epic", "yahoo_symbol", "reason", "name", "spread_pct"]
-            if etf_excluded_list
-            else ["epic", "yahoo_symbol", "reason", "name", "spread_pct"]
-        ),
-    )
-    excluded_df.to_csv(excluded_path, index=False)
-    logger.info(
-        f"📝 Saved excluded items: {excluded_path} ({len(etf_excluded_list)} items)"
-    )
 
     # Final stats
     end_time = time.time()
