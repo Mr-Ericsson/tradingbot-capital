@@ -16,7 +16,7 @@ headers = {
 BASE = os.getenv("BASE_URL")
 
 # ---- Config ----
-DEFAULT_MAX_SPREAD_FRAC = 0.002
+DEFAULT_MAX_SPREAD_FRAC = 0.003  # 0.3% spread (ändrat från 0.2%)
 DEFAULT_ALLOWED_TYPES = {
     "SHARES",
     "INDICES",
@@ -30,7 +30,7 @@ DEFAULT_ALLOWED_TYPES = {
 CONNECT_TIMEOUT = 5
 READ_TIMEOUT = 30
 POOL_SIZE = 32
-SCAN_OUTPUT_PATH = "data/scan/scan_tradeable_current.csv"
+SCAN_OUTPUT_PATH = "data/scan/all_instruments_capital.csv"  # Ändrat för att matcha EDGE-10 pipeline
 
 REJECT_MODES = {"SUSPENDED", "AUCTION", "VIEW_ONLY"}
 
@@ -101,6 +101,25 @@ def status_summary(markets):
     return dict(sorted(d.items(), key=lambda kv: kv[0]))
 
 
+def is_us_stock_epic(epic, instrument_type):
+    """Identifiera US-aktier baserat på EPIC format (samma logik som fetch_all_instruments.py)"""
+    if instrument_type.upper() != "SHARES":
+        return False
+    epic = str(epic or "").upper()
+    
+    # Blocka kända ETF:er (samma lista som i EDGE-10 pipeline)
+    blocked_etf_tickers = {
+        "QQQ", "SPY", "IVV", "VTI", "TQQQ", "SQQQ", "QLD", "QID", 
+        "XLF", "XLE", "XLI", "XLK", "XLY", "XLP", "XLU", "XLV", "XLB",
+        "VOO", "GLD", "SMH", "SOXX", "VGT", "IWM", "EFA", "EEM"
+    }
+    if epic in blocked_etf_tickers:
+        return False
+    
+    # US aktier har vanligen korta alfanumeriska koder utan punkter
+    return len(epic) <= 5 and epic.isalpha() and "." not in epic
+
+
 def row_from_market(m, max_spread_frac, allowed_types):
     status = (m.get("marketStatus") or "").upper()
     modes = {str(x).upper() for x in (m.get("marketModes") or [])}
@@ -128,6 +147,11 @@ def row_from_market(m, max_spread_frac, allowed_types):
     itype = (m.get("instrumentType") or "").upper()
     if allowed_types is not None and itype not in allowed_types:
         return None
+    
+    # US-aktie filter: bara aktier som ser ut som US-aktier
+    epic = m.get("epic", "")
+    if itype == "SHARES" and not is_us_stock_epic(epic, itype):
+        return None
 
     bid, offer = m.get("bid"), m.get("offer")
     if not bid or not offer:
@@ -138,16 +162,67 @@ def row_from_market(m, max_spread_frac, allowed_types):
     spread = abs(offer - bid)
     if mid <= 0:
         return None
+    spread_pct_val = (spread / mid) * 100
     if (spread / mid) > max_spread_frac:
         return None
+    
+    # Beräkna spread_quality (samma logik som fetch_all_instruments.py)
+    if spread_pct_val <= 0:
+        spread_quality = "no_spread"
+    elif spread_pct_val <= 0.1:
+        spread_quality = "excellent"
+    elif spread_pct_val <= 0.3:
+        spread_quality = "good"
+    elif spread_pct_val <= 1.0:
+        spread_quality = "fair"
+    else:
+        spread_quality = "poor"
+    
+    # Asset class mapping
+    asset_class_map = {
+        "SHARES": "stock",
+        "CURRENCIES": "forex", 
+        "INDICES": "index",
+        "COMMODITIES": "commodity",
+        "CRYPTOCURRENCIES": "crypto"
+    }
+    asset_class = asset_class_map.get(itype, itype.lower())
+    
+    # Market status
+    market_status = (m.get("marketStatus") or "").upper()
+    is_tradeable = market_status == "TRADEABLE"
+    
+    # US stock determination - eftersom vi redan filtrerat till US-aktier
+    is_us_stock_val = True  # Alla SHARES som kommer hit är US-aktier
+    
+    # Hämta timestamp
+    from datetime import datetime
+    timestamp = datetime.utcnow().isoformat() + "+00:00"
+    
     return {
-        "epic": m.get("epic"),
-        "bid": bid,
-        "offer": offer,
-        "spread": round(spread, 6),
-        "spread_pct": round((spread / mid) * 100, 4),
+        # EDGE-10 förväntade kolumner (samma som fetch_all_instruments.py)
+        "timestamp": timestamp,
+        "epic": epic,
         "name": (m.get("name") or m.get("instrumentName") or ""),
+        "market_id": m.get("marketId", ""),
         "type": itype,
+        "category": "US stocks" if itype == "SHARES" else "",  # Kategori för US-aktier
+        "sector": "",    # Placeholder
+        "country": "US" if itype == "SHARES" else "",   # US för aktier  
+        "base_currency": m.get("currency", "USD"),
+        "market_status": market_status,
+        "bid": bid,
+        "ask": offer,  # Capital.com kallar det "offer" men CSV använder "ask"
+        "spread_pct": round(spread_pct_val, 6),
+        "min_deal_size": m.get("dealingRules", {}).get("minStepDistance", {}).get("value", 1.0) if isinstance(m.get("dealingRules"), dict) else 1.0,
+        "max_deal_size": 0,  # Placeholder
+        "open_time": "",     # Placeholder
+        "close_time": "",    # Placeholder  
+        "percentage_change": m.get("percentageChange", 0),
+        "asset_class": asset_class,
+        "is_tradeable": is_tradeable,
+        "is_us_stock": is_us_stock_val,  # KRITISK kolumn för EDGE-10
+        "spread_quality": spread_quality,
     }
 
 
@@ -168,11 +243,11 @@ def main():
         help="Skippa spreadfilter: returnera alla TRADEABLE",
     )
 
-    ap.add_argument("--spread", type=float, default=0.005)
+    ap.add_argument("--spread", type=float, default=DEFAULT_MAX_SPREAD_FRAC)  # Använd konfigurerad default
     ap.add_argument(
         "--types",
         type=str,
-        default="CURRENCIES,INDICES,COMMODITIES,SHARES,CRYPTOCURRENCIES",
+        default="SHARES",  # Endast SHARES för US-aktier
     )
 
     ap.add_argument("--outfile", type=str, default=SCAN_OUTPUT_PATH)
@@ -191,9 +266,10 @@ def main():
     norm_types = {alias.get(t, t) for t in raw_types}
     use_all_types = (not norm_types) or ("ALL" in norm_types)
     allowed_types = None if use_all_types else norm_types
+    
+    t0 = time.time()  # Flytta t0 hit så den alltid sätts
     if datetime.utcnow().weekday() >= 5:  # lör/sön
         norm_types.add("CRYPTOCURRENCIES")
-        t0 = time.time()
 
     print("[fetch] Hämtar alla marknader...")
     markets = fetch_all_markets()
@@ -212,38 +288,40 @@ def main():
         if r:
             rows.append(r)
 
+    filter_description = "US-aktier" if "SHARES" in str(allowed_types) else "instrument"
     print(
-        f"[filter] {len(rows)} träffar <= {args.spread*100:.3f}% spread - berikar leverage..."
+        f"[filter] {len(rows)} {filter_description} <= {args.spread*100:.3f}% spread"
     )
 
-    enriched = []
-    with ThreadPoolExecutor(max_workers=POOL_SIZE) as exe:
-        futures = {exe.submit(fetch_leverage, r["epic"]): r for r in rows}
-        for fut in as_completed(futures):
-            r = futures[fut]
-            lev, mfl, mfs, mfu = fut.result()
-            (
-                r["leverage"],
-                r["marginFactorLong"],
-                r["marginFactorShort"],
-                r["marginUnit"],
-            ) = (lev, mfl, mfs, mfu)
-            enriched.append(r)
+    # Skippa leverage-berikandet för kompatibilitet med EDGE-10 format
+    enriched = rows
 
     write_csv(
         args.outfile,
         [
-            "epic",
-            "bid",
-            "offer",
-            "spread",
-            "spread_pct",
+            # EDGE-10 förväntade kolumner (samma som fetch_all_instruments.py)
+            "timestamp",
+            "epic", 
             "name",
+            "market_id",
             "type",
-            "leverage",
-            "marginFactorLong",
-            "marginFactorShort",
-            "marginUnit",
+            "category",
+            "sector", 
+            "country",
+            "base_currency",
+            "market_status",
+            "bid",
+            "ask",
+            "spread_pct",
+            "min_deal_size",
+            "max_deal_size",
+            "open_time",
+            "close_time", 
+            "percentage_change",
+            "asset_class",
+            "is_tradeable", 
+            "is_us_stock",  # KRITISK för EDGE-10
+            "spread_quality",
         ],
         enriched,
     )
