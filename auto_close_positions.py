@@ -369,21 +369,27 @@ class AutoCloseService:
                 if now_et >= trigger_time_et:
                     # Check if market is still open (not past close time)
                     if now_et >= market_close_et:
-                        logging.info("🏁 Market is closed, moving to next trading day...")
+                        logging.info(
+                            "🏁 Market is closed, moving to next trading day..."
+                        )
                         # Sleep until next trading day
                         time.sleep(3600)  # Sleep 1 hour then recalculate
                         continue
-                    
+
                     logging.info(
                         "🔥 TRIGGER TIME REACHED - Starting position closure..."
                     )
                     self._close_all_positions()
 
                     # After closure, wait until market closes then move to next day
-                    logging.info("✅ Position closure completed. Waiting until market close...")
+                    logging.info(
+                        "✅ Position closure completed. Waiting until market close..."
+                    )
                     remaining_time = (market_close_et - now_et).total_seconds()
                     if remaining_time > 0:
-                        time.sleep(min(remaining_time + 60, 3600))  # Wait until close + buffer
+                        time.sleep(
+                            min(remaining_time + 60, 3600)
+                        )  # Wait until close + buffer
                     continue
                 else:
                     # Sleep until next poll or trigger
@@ -483,7 +489,10 @@ class AutoCloseService:
                         logging.info(
                             f"✅ Successfully closed {epic}, Deal ID: {result.get('dealId')}"
                         )
-                    elif result["status"] == "DELETED" and "already" in result.get("error", "").lower():
+                    elif (
+                        result["status"] == "DELETED"
+                        and "already" in result.get("error", "").lower()
+                    ):
                         # Position was already closed - count as success
                         successful_closes += 1
                         logging.info(f"✅ {epic} was already closed")

@@ -96,24 +96,24 @@ def is_etf_yahoo_postmap(yahoo_symbol: str) -> Tuple[bool, str]:
     try:
         ticker = yf.Ticker(yahoo_symbol)
         info = ticker.info or {}
-        
+
         # quoteType check
         quote_type = (info.get("quoteType", "") or "").upper()
         if quote_type == "ETF":
             return True, f"ETF_YAHOO_POSTMAP: quoteType={quote_type}"
-        
+
         # Name-based patterns
         long_name = info.get("longName", "") or ""
         short_name = info.get("shortName", "") or ""
         nameblob = (long_name + " " + short_name).upper()
-        
+
         ETF_KEYS = [" ETF", " ETN", " ETP", " TRUST", " INDEX FUND"]
         for key in ETF_KEYS:
             if key in nameblob:
                 return True, f"ETF_YAHOO_POSTMAP: name_pattern={key.strip()}"
-        
+
         return False, ""
-        
+
     except Exception as e:
         # Fail open - vi har redan Level A ETF-filter
         return False, f"ETF_YAHOO_POSTMAP: validation_failed={str(e)[:50]}"
@@ -152,7 +152,7 @@ def get_yahoo_data(
             try:
                 cal = xcals.get_calendar("XNYS")
                 now_utc = pd.Timestamp.utcnow()
-                
+
                 # Om marknaden är öppen eller inte stängt idag, droppa sista raden
                 if cal.is_open_at_time(now_utc):
                     df = df.iloc[:-1]  # Droppa pågående dag
@@ -220,18 +220,23 @@ def compute_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def label_A_B(df: pd.DataFrame, spread: float) -> pd.DataFrame:
-    """Beräkna A_WIN/LOSS/AMBIG_LABEL och B_LABEL med spread-justering"""
+def label_A_B(
+    df: pd.DataFrame, spread: float, sl_atr_mult: float = 1.0, tp_atr_mult: float = 1.5
+) -> pd.DataFrame:
+    """Beräkna A_WIN/LOSS/AMBIG_LABEL (FIX + ATR) och B_LABEL med spread-justering"""
     df = df.copy()
 
     if pd.isna(spread):
         df["A_WIN_LABEL"] = np.nan
         df["A_LOSS_LABEL"] = np.nan
         df["A_AMBIG_LABEL"] = np.nan
+        df["A_ATR_WIN_LABEL"] = np.nan
+        df["A_ATR_LOSS_LABEL"] = np.nan
+        df["A_ATR_AMBIG_LABEL"] = np.nan
         df["B_LABEL"] = np.nan
         return df
 
-    # Nya A-labels med detaljerad TP/SL-analys
+    # FIX A-labels (2%/3% från entry) - BEHÅLLER BEFINTLIG LOGIK
     a_win_labels = []
     a_loss_labels = []
     a_ambig_labels = []
@@ -256,6 +261,43 @@ def label_A_B(df: pd.DataFrame, spread: float) -> pd.DataFrame:
     df["A_WIN_LABEL"] = a_win_labels
     df["A_LOSS_LABEL"] = a_loss_labels
     df["A_AMBIG_LABEL"] = a_ambig_labels
+
+    # ATR A-labels (ATR-adaptiva nivåer)
+    a_atr_win_labels = []
+    a_atr_loss_labels = []
+    a_atr_ambig_labels = []
+
+    for _, row in df.iterrows():
+        entry = row["Open"]
+        atr_frac = row.get("ATRfrac", 0.02)  # fallback om ATRfrac saknas
+
+        # ATR-baserade procent från entry
+        sl_pct_raw = sl_atr_mult * atr_frac
+        tp_pct_raw = tp_atr_mult * atr_frac
+
+        # Clamp + spread-justering
+        sl_pct = max(0.008, min(0.040, sl_pct_raw + spread))  # 0.8% - 4.0%
+        tp_pct = max(0.012, min(0.080, tp_pct_raw + spread))  # 1.2% - 8.0%
+
+        # ATR-baserade brutto nivåer
+        tp_atr_brutto = entry * (1 + tp_pct)
+        sl_atr_brutto = entry * (1 - sl_pct)
+
+        tp_hit = 1 if row["High"] >= tp_atr_brutto else 0
+        sl_hit = 1 if row["Low"] <= sl_atr_brutto else 0
+        both = 1 if (tp_hit == 1 and sl_hit == 1) else 0
+
+        a_atr_win = 1 if (tp_hit == 1 and sl_hit == 0) else 0
+        a_atr_loss = 1 if (sl_hit == 1 and tp_hit == 0) else 0
+        a_atr_ambig = both
+
+        a_atr_win_labels.append(a_atr_win)
+        a_atr_loss_labels.append(a_atr_loss)
+        a_atr_ambig_labels.append(a_atr_ambig)
+
+    df["A_ATR_WIN_LABEL"] = a_atr_win_labels
+    df["A_ATR_LOSS_LABEL"] = a_atr_loss_labels
+    df["A_ATR_AMBIG_LABEL"] = a_atr_ambig_labels
 
     # B_LABEL: Close >= Open * (1 + spread)
     df["B_LABEL"] = (df["Close"] >= df["Open"] * (1 + spread)).astype(int)
@@ -307,7 +349,7 @@ def match_similar(
     bin_edges: Dict[str, np.ndarray],
     features: List[str],
     n_min: int = 30,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Hitta liknande dagar med progressiv relaxering"""
 
     # Beräkna bin-index för idag
@@ -345,13 +387,20 @@ def match_similar(
         sample_a = sample.dropna(
             subset=["A_WIN_LABEL", "A_LOSS_LABEL", "A_AMBIG_LABEL"]
         )
+        sample_a_atr = sample.dropna(
+            subset=["A_ATR_WIN_LABEL", "A_ATR_LOSS_LABEL", "A_ATR_AMBIG_LABEL"]
+        )
         sample_b = sample.dropna(subset=["B_LABEL"])
 
-        if len(sample_a) >= n_min and len(sample_b) >= n_min:
-            return sample_a, sample_b
+        if (
+            len(sample_a) >= n_min
+            and len(sample_a_atr) >= n_min
+            and len(sample_b) >= n_min
+        ):
+            return sample_a, sample_a_atr, sample_b
 
     # Ingen lyckad matchning
-    return pd.DataFrame(), pd.DataFrame()
+    return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 
 def get_market_date(end_date: str) -> str:
@@ -362,24 +411,24 @@ def get_market_date(end_date: str) -> str:
     try:
         # Använd centraliserad NYSE kalender
         cal = get_nyse_calendar()
-        
+
         # Konvertera input datum till pandas Timestamp
         end_dt = pd.Timestamp(end_date).tz_localize("UTC")
-        
+
         # Hitta alla sessions inom senaste 10 dagarna
         start_search = end_dt - pd.Timedelta(days=10)
         sessions = cal.sessions_in_range(start_search.date(), end_dt.date())
-        
+
         # Ta senaste session som är <= end_date
         valid_sessions = [s for s in sessions if s <= end_dt]
-        
+
         if valid_sessions:
             last_session = valid_sessions[-1]
-            
+
             # Kontrollera att sessionen är stängd
             session_close = cal.session_close(last_session)
             now_utc = pd.Timestamp.utcnow()
-            
+
             if session_close <= now_utc:
                 # Session är stängd, safe att använda
                 return last_session.strftime("%Y-%m-%d")
@@ -387,14 +436,14 @@ def get_market_date(end_date: str) -> str:
                 # Sessionen pågår, använd föregående
                 if len(valid_sessions) > 1:
                     return valid_sessions[-2].strftime("%Y-%m-%d")
-        
+
         # Fallback till enkel weekday-logik
         end_dt_naive = datetime.strptime(end_date, "%Y-%m-%d")
         for i in range(8):
             check_date = end_dt_naive - timedelta(days=i)
             if check_date.weekday() < 5:  # Måndag=0 till Fredag=4
                 return check_date.strftime("%Y-%m-%d")
-                
+
     except Exception as e:
         # Fallback till gamla logiken om exchange_calendars misslyckas
         end_dt = datetime.strptime(end_date, "%Y-%m-%d")
@@ -475,9 +524,11 @@ def process_ticker(
     bin_edges = make_bins(train_df, features)
 
     # Hitta liknande dagar
-    sample_a, sample_b = match_similar(train_df, today_row, bin_edges, features)
+    sample_a, sample_a_atr, sample_b = match_similar(
+        train_df, today_row, bin_edges, features
+    )
 
-    # Beräkna winrates
+    # Beräkna FIX winrates (befintlig 2%/3% logik)
     if len(sample_a) >= 30:
         a_winrate = sample_a["A_WIN_LABEL"].mean()
         a_loserate = sample_a["A_LOSS_LABEL"].mean()
@@ -486,6 +537,16 @@ def process_ticker(
     else:
         a_winrate = a_loserate = a_ambigrate = np.nan
         sample_size_a = 0
+
+    # Beräkna ATR winrates (nya ATR-adaptiva nivåer)
+    if len(sample_a_atr) >= 30:
+        a_atr_winrate = sample_a_atr["A_ATR_WIN_LABEL"].mean()
+        a_atr_loserate = sample_a_atr["A_ATR_LOSS_LABEL"].mean()
+        a_atr_ambigrate = sample_a_atr["A_ATR_AMBIG_LABEL"].mean()
+        sample_size_a_atr = len(sample_a_atr)
+    else:
+        a_atr_winrate = a_atr_loserate = a_atr_ambigrate = np.nan
+        sample_size_a_atr = 0
 
     if len(sample_b) >= 30:
         b_winrate = sample_b["B_LABEL"].mean()
@@ -527,20 +588,29 @@ def process_ticker(
         "Trend50": today_row["Trend50"],
         "DayReturnPct": today_row["DayReturnPct"],
         "SpreadPct": spread,
-        "A_WINRATE": a_winrate,
+        "A_WINRATE": a_winrate,  # FIX 2%/3% befintlig
         "A_LOSERATE": a_loserate,
         "A_AMBIGRATE": a_ambigrate,
+        "A_ATR_WINRATE": a_atr_winrate,  # ATR-adaptiv 1.0x/1.5x
+        "A_ATR_LOSERATE": a_atr_loserate,
+        "A_ATR_AMBIGRATE": a_atr_ambigrate,
         "B_WINRATE": b_winrate,
         "SampleSizeA": sample_size_a,
+        "SampleSizeA_ATR": sample_size_a_atr,
         "SampleSizeB": sample_size_b,
+        # ATR-nivåer för ordergenerering
+        "SL_ATR_MULT": 1.0,  # Standard multiplier
+        "TP_ATR_MULT": 1.5,  # Standard multiplier
+        "SL_ATR_PCT": max(0.008, min(0.040, 1.0 * today_row["ATRfrac"] + spread)),
+        "TP_ATR_PCT": max(0.012, min(0.080, 1.5 * today_row["ATRfrac"] + spread)),
         "EarningsFlag": earnings_flag,
         # EDGE-10 dataschema tillägg
-        "NewsFlag": 0,  # Placeholder - behöver news API integration  
-        "SecFlag": 0,   # Placeholder - behöver SEC filings API
+        "NewsFlag": 0,  # Placeholder - behöver news API integration
+        "SecFlag": 0,  # Placeholder - behöver SEC filings API
         "SentimentScore": 0.0,  # Placeholder - behöver sentiment API
         "SectorETF": "Unknown",  # Placeholder - behöver sektor-mapping
-        "SectorStrength": 0.0,   # Placeholder - behöver sektor-performance
-        "IndexBias": 0.0,        # Placeholder - behöver index-korrelation
+        "SectorStrength": 0.0,  # Placeholder - behöver sektor-performance
+        "IndexBias": 0.0,  # Placeholder - behöver index-korrelation
     }
 
     return result
@@ -550,63 +620,73 @@ def calculate_edge_scores(results: List[dict]) -> List[dict]:
     """Beräkna EDGE-10 EdgeScore enligt specifikation:
     EdgeScore = 30% DayStrength + 30% RelVol10 + 20% Catalyst + 10% Market + 10% VolFit
     Alla komponenter rank-baserade (1-100 skala)"""
-    
+
     if not results:
         return results
-        
+
     df = pd.DataFrame(results)
     n_stocks = len(df)
-    
+
     # EDGE-10 komponenter enligt specifikation
-    
+
     # 1. DayStrength: Dagens styrka (DayReturnPct)
-    df['DayStrength_rank'] = df['DayReturnPct'].rank(method='min', ascending=True, na_option='bottom')
-    df['DayStrength'] = ((df['DayStrength_rank'] - 1) / max(1, n_stocks - 1)) * 100
-    
+    df["DayStrength_rank"] = df["DayReturnPct"].rank(
+        method="min", ascending=True, na_option="bottom"
+    )
+    df["DayStrength"] = ((df["DayStrength_rank"] - 1) / max(1, n_stocks - 1)) * 100
+
     # 2. RelVol10: Relativt volym (redan beräknad)
-    df['RelVol10_rank'] = df['RelVol10'].rank(method='min', ascending=True, na_option='bottom')
-    df['RelVol10_score'] = ((df['RelVol10_rank'] - 1) / max(1, n_stocks - 1)) * 100
-    
+    df["RelVol10_rank"] = df["RelVol10"].rank(
+        method="min", ascending=True, na_option="bottom"
+    )
+    df["RelVol10_score"] = ((df["RelVol10_rank"] - 1) / max(1, n_stocks - 1)) * 100
+
     # 3. Catalyst: Kombinera news/earnings/sector events
     # För nu: använd EarningsFlag + NewsFlag kombinerat
-    catalyst_raw = df['EarningsFlag'].fillna(0) * 2 + df['NewsFlag'].fillna(0)
-    df['Catalyst_rank'] = catalyst_raw.rank(method='min', ascending=True, na_option='bottom')
-    df['Catalyst'] = ((df['Catalyst_rank'] - 1) / max(1, n_stocks - 1)) * 100
-    
-    # 4. Market: Marknadssentiment (SectorStrength + IndexBias)
-    market_raw = df['SectorStrength'].fillna(0) + df['IndexBias'].fillna(0)
-    df['Market_rank'] = market_raw.rank(method='min', ascending=True, na_option='bottom')
-    df['Market'] = ((df['Market_rank'] - 1) / max(1, n_stocks - 1)) * 100
-    
-    # 5. VolFit: Volatilitetspassning (lägre ATRfrac = bättre, så invertera)
-    df['ATRfrac_rank'] = df['ATRfrac'].rank(method='min', ascending=False, na_option='bottom')  # Invertera
-    df['VolFit'] = ((df['ATRfrac_rank'] - 1) / max(1, n_stocks - 1)) * 100
-    
-    # Beräkna EdgeScore enligt EDGE-10 viktning
-    df['EdgeScore'] = (
-        0.30 * df['DayStrength'] +      # 30% DayStrength  
-        0.30 * df['RelVol10_score'] +   # 30% RelVol10
-        0.20 * df['Catalyst'] +         # 20% Catalyst
-        0.10 * df['Market'] +           # 10% Market
-        0.10 * df['VolFit']             # 10% VolFit
+    catalyst_raw = df["EarningsFlag"].fillna(0) * 2 + df["NewsFlag"].fillna(0)
+    df["Catalyst_rank"] = catalyst_raw.rank(
+        method="min", ascending=True, na_option="bottom"
     )
-    
+    df["Catalyst"] = ((df["Catalyst_rank"] - 1) / max(1, n_stocks - 1)) * 100
+
+    # 4. Market: Marknadssentiment (SectorStrength + IndexBias)
+    market_raw = df["SectorStrength"].fillna(0) + df["IndexBias"].fillna(0)
+    df["Market_rank"] = market_raw.rank(
+        method="min", ascending=True, na_option="bottom"
+    )
+    df["Market"] = ((df["Market_rank"] - 1) / max(1, n_stocks - 1)) * 100
+
+    # 5. VolFit: Volatilitetspassning (lägre ATRfrac = bättre, så invertera)
+    df["ATRfrac_rank"] = df["ATRfrac"].rank(
+        method="min", ascending=False, na_option="bottom"
+    )  # Invertera
+    df["VolFit"] = ((df["ATRfrac_rank"] - 1) / max(1, n_stocks - 1)) * 100
+
+    # Beräkna EdgeScore enligt EDGE-10 viktning
+    df["EdgeScore"] = (
+        0.30 * df["DayStrength"]  # 30% DayStrength
+        + 0.30 * df["RelVol10_score"]  # 30% RelVol10
+        + 0.20 * df["Catalyst"]  # 20% Catalyst
+        + 0.10 * df["Market"]  # 10% Market
+        + 0.10 * df["VolFit"]  # 10% VolFit
+    )
+
     # Avrunda EdgeScore
-    df['EdgeScore'] = df['EdgeScore'].round(1)
-    
+    df["EdgeScore"] = df["EdgeScore"].round(1)
+
     # Kopiera tillbaka till results
     for i, result in enumerate(results):
-        result["Score"] = df.loc[i, 'EdgeScore']
-        result["DayStrength"] = df.loc[i, 'DayStrength'].round(1)
-        result["Catalyst"] = df.loc[i, 'Catalyst'].round(1) 
-        result["Market"] = df.loc[i, 'Market'].round(1)
-        result["VolFit"] = df.loc[i, 'VolFit'].round(1)
+        result["Score"] = df.loc[i, "EdgeScore"]
+        result["DayStrength"] = df.loc[i, "DayStrength"].round(1)
+        result["Catalyst"] = df.loc[i, "Catalyst"].round(1)
+        result["Market"] = df.loc[i, "Market"].round(1)
+        result["VolFit"] = df.loc[i, "VolFit"].round(1)
 
     return results
 
 
 def select_top_candidates(results: List[dict]) -> Tuple[List[dict], List[dict]]:
-    """Välj TOP-100 och TOP-10 kandidater enligt EDGE-10 spec"""
+    """Välj TOP-100 och TOP-10 kandidater enligt ATR-Adaptiv EDGE-10 spec"""
     df = pd.DataFrame(results)
 
     # TOP-100: sortera på EdgeScore (högst först)
@@ -618,32 +698,39 @@ def select_top_candidates(results: List[dict]) -> Tuple[List[dict], List[dict]]:
 
     top_100 = df_sorted.head(100).to_dict("records")
 
-    # TOP-10 urval: Välj TOP-10 via EdgeScore RANK
+    # TOP-10 urval: ATR-Adaptiv prioritering
     top_10 = []
-    
-    # EDGE-10 spec: Primary selection via EdgeScore ranking
+
+    # ATR-Adaptiv spec: Primary sortering EdgeScore → A_ATR_WINRATE → B_WINRATE → A_WINRATE → RelVol10
     candidates_sorted = df.sort_values(
-        ["Score", "A_WINRATE", "B_WINRATE"],  # EdgeScore först, sedan A/B som tiebreaker
-        ascending=[False, False, False],
+        ["Score", "A_ATR_WINRATE", "B_WINRATE", "A_WINRATE", "RelVol10"],
+        ascending=[False, False, False, False, False],
         na_position="last",
     )
 
-    # Sample size validation: flagga <30 samples
+    # Sample size validation: flagga SampleSizeA_ATR<30 eller SampleSizeB<30
     for _, row in candidates_sorted.iterrows():
         sample_a = row.get("SampleSizeA", 0)
-        sample_b = row.get("SampleSizeB", 0) 
-        
+        sample_a_atr = row.get("SampleSizeA_ATR", 0)
+        sample_b = row.get("SampleSizeB", 0)
+
         sample_warning = ""
-        if sample_a < 30:
-            sample_warning += f"SampleA={sample_a}<30; "
+        if sample_a_atr < 30:
+            sample_warning += f"SampleA_ATR={sample_a_atr}<30; "
         if sample_b < 30:
             sample_warning += f"SampleB={sample_b}<30; "
-            
+        if sample_a < 30:
+            sample_warning += f"SampleA={sample_a}<30; "
+
         row_dict = row.to_dict()
-        row_dict["PickReason"] = f"EdgeScore={row['Score']:.1f}" + (f" [{sample_warning.strip()}]" if sample_warning else "")
-        
+        pick_reason = f"EdgeScore={row['Score']:.1f}"
+        if not pd.isna(row.get("A_ATR_WINRATE")):
+            pick_reason += f",ATR_WIN={row['A_ATR_WINRATE']:.2f}"
+        pick_reason += f" [{sample_warning.strip()}]" if sample_warning else ""
+        row_dict["PickReason"] = pick_reason
+
         top_10.append(row_dict)
-        
+
         if len(top_10) >= 10:
             break
 
@@ -697,7 +784,7 @@ def format_output_row(row_dict: dict) -> dict:
 
     # EDGE-10 flags och scores
     formatted["EarningsFlag"] = row_dict.get("EarningsFlag", "N/A")
-    formatted["NewsFlag"] = row_dict.get("NewsFlag", "N/A") 
+    formatted["NewsFlag"] = row_dict.get("NewsFlag", "N/A")
     formatted["SecFlag"] = row_dict.get("SecFlag", "N/A")
     formatted["SentimentScore"] = format_number(row_dict.get("SentimentScore"), 2)
     formatted["SectorETF"] = row_dict.get("SectorETF", "N/A")
@@ -719,7 +806,7 @@ def format_output_row(row_dict: dict) -> dict:
 
 
 def save_results(
-    results: List[dict], top_100: List[dict], top_10: List[dict], outdir: str
+    results: List[dict], top_100: List[dict], top_10: List[dict], outdir: str, logger
 ):
     """Spara alla tre CSV-filer"""
 
@@ -749,19 +836,27 @@ def save_results(
         "A_WINRATE",
         "A_LOSERATE",
         "A_AMBIGRATE",
+        "A_ATR_WINRATE",  # Ny ATR-kolumn
+        "A_ATR_LOSERATE",  # Ny ATR-kolumn
+        "A_ATR_AMBIGRATE",  # Ny ATR-kolumn
         "B_WINRATE",
         "SampleSizeA",
+        "SampleSizeA_ATR",  # Ny ATR-kolumn
         "SampleSizeB",
+        "SL_ATR_MULT",  # Ny ATR-kolumn
+        "TP_ATR_MULT",  # Ny ATR-kolumn
+        "SL_ATR_PCT",  # Ny ATR-kolumn
+        "TP_ATR_PCT",  # Ny ATR-kolumn
         "EarningsFlag",
         "NewsFlag",
-        "SecFlag", 
+        "SecFlag",
         "SentimentScore",
         "SectorETF",
         "SectorStrength",
         "IndexBias",
         "DayStrength",
         "Catalyst",
-        "Market", 
+        "Market",
         "VolFit",
         "Score",
     ]
@@ -776,19 +871,49 @@ def save_results(
     df_top100 = pd.DataFrame(top100_formatted, columns=base_columns)
     df_top100.to_csv(os.path.join(outdir, "top_100.csv"), index=False)
 
-    # TOP-10 (with PickReason + SampleA/SampleB columns)
-    top10_columns = base_columns + ["SampleA", "SampleB", "PickReason"]
+    # TOP-10 (with PickReason + SampleA/SampleB/ATR columns)
+    top10_columns = base_columns + ["SampleA", "SampleB", "SampleA_ATR", "PickReason"]
     top10_formatted = []
-    
+
     for row in top_10:
         formatted_row = format_output_row(row)
-        # Add SampleA and SampleB columns
+        # Add SampleA, SampleB, and SampleA_ATR columns
         formatted_row["SampleA"] = row.get("SampleSizeA", 0)
         formatted_row["SampleB"] = row.get("SampleSizeB", 0)
+        formatted_row["SampleA_ATR"] = row.get("SampleSizeA_ATR", 0)
         top10_formatted.append(formatted_row)
-        
+
     df_top10 = pd.DataFrame(top10_formatted, columns=top10_columns)
     df_top10.to_csv(os.path.join(outdir, "top_10.csv"), index=False)
+
+    # ATR Label Summary (ny enligt spec)
+    atr_summary_data = []
+    for row in results:
+        if row.get("A_ATR_WINRATE") is not None:  # Endast aktier med ATR-data
+            atr_summary_data.append(
+                {
+                    "Ticker": row["Ticker"],
+                    "SampleSizeA_ATR": row.get("SampleSizeA_ATR", 0),
+                    "A_ATR_WINRATE": row.get("A_ATR_WINRATE", 0),
+                    "A_ATR_LOSERATE": row.get("A_ATR_LOSERATE", 0),
+                    "A_ATR_AMBIGRATE": row.get("A_ATR_AMBIGRATE", 0),
+                    "SL_ATR_MULT": row.get("SL_ATR_MULT", 1.0),
+                    "TP_ATR_MULT": row.get("TP_ATR_MULT", 1.5),
+                    "SL_bounds_hits": (
+                        1 if row.get("SL_ATR_PCT", 0) in [0.008, 0.040] else 0
+                    ),
+                    "TP_bounds_hits": (
+                        1 if row.get("TP_ATR_PCT", 0) in [0.012, 0.080] else 0
+                    ),
+                }
+            )
+
+    if atr_summary_data:
+        df_atr_summary = pd.DataFrame(atr_summary_data)
+        df_atr_summary.to_csv(
+            os.path.join(outdir, "atr_label_summary.csv"), index=False
+        )
+        logger.info(f"💾 Saved ATR label summary to {outdir}/atr_label_summary.csv")
 
 
 def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
@@ -803,7 +928,7 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
 
     logger.info(f"Total instruments i CSV: {len(df)}")
-    
+
     # Initialize excluded tracking
     excluded_list = []
 
@@ -811,12 +936,14 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
     df_us = df[df["is_us_stock"] == True].copy()
     non_us = df[df["is_us_stock"] != True]
     for _, row in non_us.iterrows():
-        excluded_list.append({
-            'epic': row.get('epic', ''),
-            'name': row.get('name', ''),
-            'reason': 'Not US stock',
-            'filter_stage': 'US-filter'
-        })
+        excluded_list.append(
+            {
+                "epic": row.get("epic", ""),
+                "name": row.get("name", ""),
+                "reason": "Not US stock",
+                "filter_stage": "US-filter",
+            }
+        )
     logger.info(f"Efter US-aktie filter: {len(df_us)}")
 
     # Filter 2: DUBBEL ETF-filtering (enligt EDGE-10 spec failsafe)
@@ -825,88 +952,119 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
         """LEVEL A: Kontrollera ETF/leveraged via keywords och blocked tickers"""
         epic = str(row.get("epic", "")).upper()
         name = str(row.get("name", "")).upper()
-        
+
         # ETF patterns
-        etf_patterns = ["ETF", "FUND", "TRUST", "INDEX", "SPDR", "ISHARES", "VANGUARD", "INVESCO"]
-        # Leveraged patterns  
+        etf_patterns = [
+            "ETF",
+            "FUND",
+            "TRUST",
+            "INDEX",
+            "SPDR",
+            "ISHARES",
+            "VANGUARD",
+            "INVESCO",
+        ]
+        # Leveraged patterns
         leveraged_patterns = ["ULTRA", "2X", "3X", "DIREXION", "PROSHARES"]
         # Specific blocked tickers
-        blocked_tickers = ["QQQ", "SPY", "IVV", "VTI", "TQQQ", "SQQQ", "QLD", "QID", "XLF", "XLE", "XLI", "XLK"]
-        
+        blocked_tickers = [
+            "QQQ",
+            "SPY",
+            "IVV",
+            "VTI",
+            "TQQQ",
+            "SQQQ",
+            "QLD",
+            "QID",
+            "XLF",
+            "XLE",
+            "XLI",
+            "XLK",
+        ]
+
         # Check name patterns
         for pattern in etf_patterns + leveraged_patterns:
             if pattern in name:
                 return True, f"ETF/Leveraged pattern: {pattern}"
-                
+
         # Check blocked tickers
         if epic in blocked_tickers:
             return True, f"Blocked ticker: {epic}"
-            
+
         return False, None
-    
+
     # LEVEL B: Yahoo Finance quoteType validation
     def is_yahoo_etf(row):
         """LEVEL B: Yahoo Finance quoteType=='ETF' validation"""
         try:
             epic = str(row.get("epic", ""))
             yahoo_symbol = epic  # For now, assume direct mapping
-            
+
             # Fetch Yahoo data
             import yfinance as yf
+
             ticker = yf.Ticker(yahoo_symbol)
             info = ticker.info
-            
+
             # Check quoteType
             quote_type = info.get("quoteType", "").upper()
             if quote_type == "ETF":
                 return True, f"Yahoo quoteType: {quote_type}"
-                
+
         except Exception as e:
             logger.warning(f"Yahoo validation failed for {epic}: {e}")
-            
+
         return False, None
-    
+
     # Apply LEVEL A filtering first
     level_a_excluded = []
     level_a_keep = []
-    
+
     for _, row in df_us.iterrows():
         is_excluded, reason = is_etf_or_leveraged_keywords(row)
         if is_excluded:
-            excluded_list.append({
-                'epic': row.get('epic', ''),
-                'name': row.get('name', ''),
-                'reason': reason,
-                'filter_stage': 'ETF-LEVEL-A'
-            })
+            excluded_list.append(
+                {
+                    "epic": row.get("epic", ""),
+                    "name": row.get("name", ""),
+                    "reason": reason,
+                    "filter_stage": "ETF-LEVEL-A",
+                }
+            )
             level_a_excluded.append(row)
         else:
             level_a_keep.append(row)
-    
+
     df_level_a = pd.DataFrame(level_a_keep)
-    logger.info(f"Efter LEVEL A ETF filter: {len(df_level_a)} (exkluderade {len(level_a_excluded)} via keywords)")
-    
+    logger.info(
+        f"Efter LEVEL A ETF filter: {len(df_level_a)} (exkluderade {len(level_a_excluded)} via keywords)"
+    )
+
     # Apply LEVEL B filtering (sample validation on subset for performance)
     if len(df_level_a) > 100:
         # Sample 50 random instruments for Yahoo validation
         sample_df = df_level_a.sample(n=50, random_state=42)
         yahoo_etfs = []
-        
+
         for _, row in sample_df.iterrows():
             is_etf, reason = is_yahoo_etf(row)
             if is_etf:
-                excluded_list.append({
-                    'epic': row.get('epic', ''),
-                    'name': row.get('name', ''),
-                    'reason': reason,
-                    'filter_stage': 'ETF-LEVEL-B'
-                })
-                yahoo_etfs.append(row['epic'])
-        
+                excluded_list.append(
+                    {
+                        "epic": row.get("epic", ""),
+                        "name": row.get("name", ""),
+                        "reason": reason,
+                        "filter_stage": "ETF-LEVEL-B",
+                    }
+                )
+                yahoo_etfs.append(row["epic"])
+
         if len(yahoo_etfs) > 0:
-            logger.warning(f"🚨 LEVEL B detected {len(yahoo_etfs)} Yahoo ETFs in sample: {yahoo_etfs}")
+            logger.warning(
+                f"🚨 LEVEL B detected {len(yahoo_etfs)} Yahoo ETFs in sample: {yahoo_etfs}"
+            )
             # Remove any detected ETFs from full dataset
-            df_stocks_only = df_level_a[~df_level_a['epic'].isin(yahoo_etfs)].copy()
+            df_stocks_only = df_level_a[~df_level_a["epic"].isin(yahoo_etfs)].copy()
         else:
             df_stocks_only = df_level_a.copy()
             logger.info("✅ LEVEL B validation: No Yahoo ETFs detected in sample")
@@ -916,29 +1074,39 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
         for _, row in df_level_a.iterrows():
             is_etf, reason = is_yahoo_etf(row)
             if is_etf:
-                excluded_list.append({
-                    'epic': row.get('epic', ''),
-                    'name': row.get('name', ''),
-                    'reason': reason,
-                    'filter_stage': 'ETF-LEVEL-B'
-                })
+                excluded_list.append(
+                    {
+                        "epic": row.get("epic", ""),
+                        "name": row.get("name", ""),
+                        "reason": reason,
+                        "filter_stage": "ETF-LEVEL-B",
+                    }
+                )
             else:
                 level_b_keep.append(row)
         df_stocks_only = pd.DataFrame(level_b_keep)
-    
+
     total_excluded = len(df_us) - len(df_stocks_only)
-    logger.info(f"🛡️ DUBBEL ETF-filter komplett: {len(df_stocks_only)} stocks (exkluderade {total_excluded} ETF:er totalt)")
+    logger.info(
+        f"🛡️ DUBBEL ETF-filter komplett: {len(df_stocks_only)} stocks (exkluderade {total_excluded} ETF:er totalt)"
+    )
 
     # Filter 3: Handlingsbar (bid > 0 och ask > 0)
-    not_tradeable = df_stocks_only[(df_stocks_only["bid"] <= 0) | (df_stocks_only["ask"] <= 0)]
+    not_tradeable = df_stocks_only[
+        (df_stocks_only["bid"] <= 0) | (df_stocks_only["ask"] <= 0)
+    ]
     for _, row in not_tradeable.iterrows():
-        excluded_list.append({
-            'epic': row.get('epic', ''),
-            'name': row.get('name', ''),
-            'reason': f"Not tradeable - bid:{row.get('bid',0)} ask:{row.get('ask',0)}",
-            'filter_stage': 'Tradeable-filter'
-        })
-    df_tradeable = df_stocks_only[(df_stocks_only["bid"] > 0) & (df_stocks_only["ask"] > 0)].copy()
+        excluded_list.append(
+            {
+                "epic": row.get("epic", ""),
+                "name": row.get("name", ""),
+                "reason": f"Not tradeable - bid:{row.get('bid',0)} ask:{row.get('ask',0)}",
+                "filter_stage": "Tradeable-filter",
+            }
+        )
+    df_tradeable = df_stocks_only[
+        (df_stocks_only["bid"] > 0) & (df_stocks_only["ask"] > 0)
+    ].copy()
     logger.info(f"Efter tradeable filter: {len(df_tradeable)}")
 
     # Filter 4: Spread ≤ 0.3% (0.003 i decimal)
@@ -948,12 +1116,14 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
     )
     high_spread = df_tradeable[df_tradeable["spread_pct_norm"] > 0.003]
     for _, row in high_spread.iterrows():
-        excluded_list.append({
-            'epic': row.get('epic', ''),
-            'name': row.get('name', ''),
-            'reason': f"High spread: {row.get('spread_pct_norm',0):.4f} > 0.003",
-            'filter_stage': 'Spread-filter'
-        })
+        excluded_list.append(
+            {
+                "epic": row.get("epic", ""),
+                "name": row.get("name", ""),
+                "reason": f"High spread: {row.get('spread_pct_norm',0):.4f} > 0.003",
+                "filter_stage": "Spread-filter",
+            }
+        )
     df_spread = df_tradeable[df_tradeable["spread_pct_norm"] <= 0.003].copy()
     logger.info(f"Efter spread ≤ 0.3% filter: {len(df_spread)}")
 
@@ -961,21 +1131,27 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
     df_spread["mid_price"] = (df_spread["bid"] + df_spread["ask"]) / 2
     low_price = df_spread[df_spread["mid_price"] < 2.0]
     for _, row in low_price.iterrows():
-        excluded_list.append({
-            'epic': row.get('epic', ''),
-            'name': row.get('name', ''),
-            'reason': f"Price too low: ${row.get('mid_price',0):.2f} < $2.00",
-            'filter_stage': 'Price-filter'
-        })
+        excluded_list.append(
+            {
+                "epic": row.get("epic", ""),
+                "name": row.get("name", ""),
+                "reason": f"Price too low: ${row.get('mid_price',0):.2f} < $2.00",
+                "filter_stage": "Price-filter",
+            }
+        )
     df_final = df_spread[df_spread["mid_price"] >= 2.0].copy()
-    logger.info(f"Efter prisgolv ≥ $2 filter: {len(df_final)} (ENDAST US-AKTIER, INGA ETF:er)")
+    logger.info(
+        f"Efter prisgolv ≥ $2 filter: {len(df_final)} (ENDAST US-AKTIER, INGA ETF:er)"
+    )
 
-    # Save excluded.csv 
+    # Save excluded.csv
     if excluded_list:
         excluded_df = pd.DataFrame(excluded_list)
-        excluded_path = csv_path.replace('.csv', '_excluded.csv')
+        excluded_path = csv_path.replace(".csv", "_excluded.csv")
         excluded_df.to_csv(excluded_path, index=False)
-        logger.info(f"💾 Saved {len(excluded_list)} excluded instruments to {excluded_path}")
+        logger.info(
+            f"💾 Saved {len(excluded_list)} excluded instruments to {excluded_path}"
+        )
 
     # Lägg till Yahoo symbol
     df_final["symbol_yahoo"] = df_final["epic"].apply(map_capital_symbol_to_yahoo)
@@ -984,11 +1160,11 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
     logger.info("🔍 POST-MAPPING ETF CHECK: Validating Yahoo symbols...")
     post_map_excluded = []
     pre_postmap_count = len(df_final)
-    
+
     for idx, row in df_final.iterrows():
         yahoo_symbol = row["symbol_yahoo"]
         is_etf, reason = is_etf_yahoo_postmap(yahoo_symbol)
-        
+
         if is_etf:
             # Add to excluded list
             excluded_row = {
@@ -996,19 +1172,25 @@ def load_and_filter_capital_csv(csv_path: str, logger) -> pd.DataFrame:
                 "name": row["name"],
                 "symbol_yahoo": yahoo_symbol,
                 "reason": reason,
-                "filter_stage": "POST_MAP_ETF_CHECK"
+                "filter_stage": "POST_MAP_ETF_CHECK",
             }
             post_map_excluded.append(excluded_row)
             excluded_list.append(excluded_row)
-    
+
     # Remove ETFs found in post-mapping check
     if post_map_excluded:
         etf_symbols = [e["symbol_yahoo"] for e in post_map_excluded]
         df_final = df_final[~df_final["symbol_yahoo"].isin(etf_symbols)].copy()
-        logger.info(f"🚫 POST-MAP ETF FILTER: Removed {len(post_map_excluded)} ETFs after Yahoo validation")
-        logger.info(f"   ETFs found: {', '.join(etf_symbols[:10])}{' ...' if len(etf_symbols) > 10 else ''}")
-    
-    logger.info(f"Efter POST-MAPPING ETF check: {len(df_final)} aktier ({pre_postmap_count - len(df_final)} ETF:er excluded)")
+        logger.info(
+            f"🚫 POST-MAP ETF FILTER: Removed {len(post_map_excluded)} ETFs after Yahoo validation"
+        )
+        logger.info(
+            f"   ETFs found: {', '.join(etf_symbols[:10])}{' ...' if len(etf_symbols) > 10 else ''}"
+        )
+
+    logger.info(
+        f"Efter POST-MAPPING ETF check: {len(df_final)} aktier ({pre_postmap_count - len(df_final)} ETF:er excluded)"
+    )
 
     return df_final
 
@@ -1077,7 +1259,7 @@ def main():
     top_100, top_10 = select_top_candidates(results)
 
     # Spara alla filer
-    save_results(results, top_100, top_10, args.outdir)
+    save_results(results, top_100, top_10, args.outdir, logger)
 
     logger.info(
         f"Saved {len(results)} total, {len(top_100)} TOP-100, {len(top_10)} TOP-10"
